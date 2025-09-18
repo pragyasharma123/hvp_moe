@@ -47,6 +47,15 @@ class HVPOperator(Operator):
             size = int(sum(p.numel() for name, p in model.named_parameters() if 'conv' in name and 'weight' in name and 'layer_norm' not in name))
         elif args.arch=="SAGE":
             size = int(sum(p.numel() for name, p in model.named_parameters() if 'conv' in name and 'weight' in name and 'lin_r' not in name))
+        elif args.arch=="deepseek":
+            size = int(sum(
+            p.numel()
+            for name, p in model.named_parameters()
+            if ("mlp.experts" in name or "mlp.shared_experts" in name) and "weight" in name
+        ))
+
+
+            
         else: # vgg/resnet/vit etc.
             size = int(sum(p.numel() for name, p in model.named_parameters() if 'conv' in name and 'weight' in name and 'norm' not in name or 'linear' in name and 'bias' not in name))
         
@@ -112,6 +121,10 @@ class HVPOperator(Operator):
                 if 'conv' in name and 'weight' in name and 'lin_r' not in name:
                     weights = p
                     hessian_vec_prod_dict.append(torch.autograd.grad(grad_vec, weights, grad_outputs=vec, only_inputs=True, retain_graph=True)[0])
+            elif args.arch=="deepseek":
+                if "mlp.experts" in name and "weight" in name:
+                    weights = p
+                    hessian_vec_prod_dict.append(torch.autograd.grad(grad_vec, weights, grad_outputs=vec,only_inputs=True, retain_graph=True)[0])
             elif args.task_type=="image": #CNN
                 if 'conv' in name and 'weight' in name and 'norm' not in name or 'linear' in name and 'bias' not in name:
                     weights = p
@@ -188,7 +201,9 @@ class HVPOperator(Operator):
                     input = torch.FloatTensor(np.array(input)).cuda()
                     target = torch.LongTensor(np.array(target)).cuda()
                     adj=self.train_support.cuda()#[0] # giving 0th from func call in main
-                
+                elif args.task_type=="text":
+                    input= input.cuda()
+                    target=target.cuda()
                 #adj=self.train_support.cuda()#[0] # giving 0th from func call in main
                 #print('adj shape', np.shape(adj)) # prints (3,)
                 '''
@@ -227,6 +242,9 @@ class HVPOperator(Operator):
             elif args.task_type=="image":
                 output = self.model(input) # cnn
                 loss = self.criterion(output, target) # cnn
+            elif args.task_type=="text":
+                outputs = self.model(input, labels=target)
+                loss = outputs.loss
             else:
                 print("wrong task")
                 exit()
@@ -250,6 +268,12 @@ class HVPOperator(Operator):
                     if 'conv' in name and 'weight' in name and 'lin_r' not in name:
                         weights = p
                         grad_dict.append(torch.autograd.grad(loss, weights, create_graph=True)[0])
+                elif args.arch=="deepseek":
+                    if ("mlp.experts" in name or "mlp.shared_experts" in name) and "weight" in name:
+                        weights = p
+                        grad_dict.append(torch.autograd.grad(loss, weights, create_graph=True)[0])
+
+       
                 else: # CNN
                     if 'conv' in name and 'weight' in name and 'norm' not in name or 'linear' in name and 'bias' not in name:
                         #print('Y')
