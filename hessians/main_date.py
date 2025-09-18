@@ -9,6 +9,9 @@ import utils as utils
 
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
+import transformers
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 
 import tf_utils
 import sklearn.metrics
@@ -27,7 +30,30 @@ import scipy.sparse as sp
 import json
 
 from args import parse_args
-args = parse_args()
+
+# -------------------------
+# Add DeepSeek arguments
+# -------------------------
+def add_deepseek_args(parser):
+    parser.add_argument(
+        "--model_path", type=str, default="./my_deepseek",
+        help="Path to local DeepSeek model snapshot or HuggingFace repo id"
+    )
+    parser.add_argument(
+        "--trust_remote_code", action="store_true",
+        help="Enable trust_remote_code when loading DeepSeek models"
+    )
+    parser.add_argument(
+        "--disable_flash_attention", action="store_true",
+        help="Disable flash/mem-efficient attention so HVP (double backward) works"
+    )
+    return parser
+
+# Extend the existing parser
+parser = parse_args(return_parser=True)  # <-- make parse_args return parser if asked
+parser = add_deepseek_args(parser)
+args = parser.parse_args()
+
 
 # Reproducibility
 np.random.seed(0)
@@ -479,198 +505,154 @@ def main():
         print("runtime OU : disable enable_noise_weights for kernel/layer senstivity through hessian")
         exit()
 
-    #if args.accuracy_eval and not args.enable_noise_weights:
-    #    print("for non-ideal accuracy calc., enable enable_noise_adj and enable_noise_weights")
-    #    exit()
-    
+    # --------------------------
+    # DeepSeek branch
+    # --------------------------
+    if args.arch=="deepseek" and args.task_type=="text":
+        print("=> Running DeepSeek MoE Hessian eigenthings")
+
+        # Load DeepSeek model + tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_path,
+            trust_remote_code=args.trust_remote_code
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=args.trust_remote_code
+        )
+        model.train()
+
+        # Disable FlashAttention if requested
+        if args.disable_flash_attention:
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_math_sdp(True)
+
+        # Minimal text dataset for HVP
+        text = "The quick brown fox jumps over the lazy dog."
+        inputs = tokenizer(text, return_tensors="pt")
+        labels = inputs["input_ids"].clone()
+        dataset = [(inputs["input_ids"].squeeze(0), labels.squeeze(0))]
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+
+        criterion = torch.nn.CrossEntropyLoss()
+
+        # Compute Hessian eigenthings
+        print("Computing hessian eigenthings for DeepSeek...")
+        eigenvals, eigenvecs = compute_hessian_eigenthings(
+            model,
+            dataloader,
+            None,  # train_support not needed for text
+            criterion,
+            args.num_eigenthings,
+            mode=args.mode,
+            max_possible_gpu_samples=args.max_samples,
+            full_dataset=args.full_dataset,
+            use_gpu=True
+        )
+        print("Eigenvals:", eigenvals)
+        print("Eigenvecs:", eigenvecs)
+        return  # ✅ stop after DeepSeek
+
+    # --------------------------
+    # Graph / Image branches (unchanged)
+    # --------------------------
     if args.task_type=="graph":
         modelfile = 'saves/'+args.arch+'/'+args.dataset+'/'+args.pre_trained_model
-
         if not os.path.isfile(modelfile):
             print('pre-trained model not found')
             exit()
         else:
             print('pre-trained model (GCN/GAT/SAGE) exists')
-    
-    # Load data
-    start = time.time()
-    
-    if args.task_type=="graph":
-        eigenvecs, eigenvals = None, None # for graphs they will not be evaluated here
-        train_support, train_features, dataloader = graph_data_processing(start)
 
+    start = time.time()
+    if args.task_type=="graph":
+        eigenvecs, eigenvals = None, None
+        train_support, train_features, dataloader = graph_data_processing(start)
     elif args.task_type=="image":
         if args.compute_hessian==0 and args.validation_phase==1:
             train_support, dataloader, eigenvecs, eigenvals = None, None, None, None
         else:
             train_support, dataloader, eigenvecs, eigenvals = image_data_processing()
-
     else:
         print("invalid task... fix task_type arguement")
         exit()
 
-    # Loss Function # common for all tasks
     criterion = torch.nn.CrossEntropyLoss()
 
-    # model # model is called in runtime_ou_optim function later # so its outside any if condition for the moment
     if args.task_type=="graph":
-        model = GCN(fan_in=_in, fan_out=_out, layers=args.layers,  dropout=args.dropout, normalize=True, bias=False).float() #num_nodes=train_adj.shape[0],
+        model = GCN(fan_in=_in, fan_out=_out, layers=args.layers,  
+                    dropout=args.dropout, normalize=True, bias=False).float()
         print(model)
         model.cuda()
 
-
-    if args.task_type=="graph":
-        # Optimization Algorithm
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-        
-        # Learning Rate Schedule    
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=int(args.num_clusters_train/args.batch_size), epochs=args.epochs+1, anneal_strategy='linear')
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=args.lr,
+            steps_per_epoch=int(args.num_clusters_train/args.batch_size),
+            epochs=args.epochs+1, anneal_strategy='linear'
+        )
         model.train()
 
-        # Train only for graph
-        # no training in moo code, so test=1
-
-    
-
-        # Shuffle Batches
         batch_idxs = list(range(len(train_features)))
         print('len(batch_idxs)',len(batch_idxs))
 
         if not args.test: # training
             print("training")
-        
             for epoch in range(args.epochs + 1):
-                #print('epoch', epoch)
                 np.random.shuffle(batch_idxs)
-                avg_loss = 0
-                total_accuracy = 0
-                total_total = 0
+                avg_loss, total_accuracy, total_total = 0,0,0
                 start = time.time()
                 for batch in batch_idxs:
-                    loss, accuracy, total = train(model.cuda(), criterion, optimizer, train_features[batch], train_support[batch], y_train[batch], dataset=args.dataset)
+                    loss, accuracy, total = train(
+                        model.cuda(), criterion, optimizer, 
+                        train_features[batch], train_support[batch], y_train[batch], 
+                        dataset=args.dataset
+                    )
                     if args.lr_scheduler == 1:
                         scheduler.step()
                     avg_loss += loss.item()
                     total_accuracy += accuracy
                     total_total += total
-                acc =  float(total_accuracy)/float(total_total)
+                acc = float(total_accuracy)/float(total_total)
                 print(acc)
-        
-                # Write Train stats to tensorboard
                 writer.add_scalar('time/train', time.time() - start, epoch)
                 writer.add_scalar('loss/train', avg_loss/len(train_features), epoch)
 
-                # inside train loop - experiment used to find hessian importance in each epoch
-                '''
-                # save the model
-                filename = 'saves/'+args.dataset+'/'+'1_noise_checkpoint.pth.tar'
-                save_checkpoint(state={
-                    'epoch': epoch + 1,
-                    'state_dict': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                }, filename=filename)
-
-                # compute hessian
-                #train_model = torch.load(f"{filename}") # doesnt work for this dict structure
-                print("=> loading checkpoint '{}'".format(filename))
-                checkpoint = torch.load(filename)
-                model.load_state_dict(checkpoint['state_dict'])
-                #optimizer.load_state_dict(checkpoint['optimizer']) # not needed
-                print("=> loaded checkpoint '{}'"
-                      .format(filename))
-                print(model)
-                #exit()
-                #train_adj = train_support[args.batch]
-                adj_h=train_support[args.batch] # subgraph
-                #print('adj shape', np.shape(adj)) # prints (3,)
-                
-                # Adj -> Torch Sparse Tensor
-                i = torch.LongTensor(adj_h[0]) # indices
-                v = torch.FloatTensor(adj_h[1]) # values
-                #adj = torch.sparse.FloatTensor(i.t(), v, adj[2]).cuda()
-                adj_h = torch.sparse_coo_tensor(i.t(), v, adj_h[2]).cuda()
-
-                print("Computing hessian score")
-                eigenvals, eigenvecs = compute_hessian_eigenthings(
-                                    model, # without noise
-                                    dataloader, #
-                                    adj_h,#train_support[0], #
-                                    criterion, #
-                                    args.num_eigenthings,
-                                    mode=args.mode,
-                                    # power_iter_steps=args.num_steps,
-                                    max_possible_gpu_samples=args.max_samples,
-                                    # momentum=args.momentum,
-                                    full_dataset=args.full_dataset,
-                                    use_gpu=True#use_cuda,
-                                    )
-                print("Eigenvecs:")
-                print(eigenvecs)
-                #print('eigenvecs shape',eigenvecs.shape)
-                print("Eigenvals:")
-                print(eigenvals)
-
-                delta_w=0            
-
-                nonidealities=layer_score_func_training(epoch, model, delta_w, eigenvecs, eigenvals)
-                '''
-
-        
-            # outside train loop
             filename = 'saves/'+args.dataset+'/'+'0_noise_checkpoint.pth.tar'
-            save_checkpoint(state={
+            save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-            }, filename=filename)
-        
-    ########################################
-    # run for all type of tasks
-    if args.test:   # inference     # for graphs, images, etc.
+            }, filename)
+
+    if args.test:   # inference
         if args.runtime_ou==0:
             if not args.accuracy_eval:
                 print('running MOO')
-                offline_moo_optimization(10**0, train_support, dataloader, criterion, eigenvecs, eigenvals ) # updated arguements on july 14, 2025
+                offline_moo_optimization(10**0, train_support, dataloader, criterion, eigenvecs, eigenvals)
             else:
                 print('accuracy eval mode starting...')
-
-                temperature=np.full((args.layers+1), 20, dtype=int)#[300,300,300,300,300]
-                #temperature=[1,1,20,20,1]
-                ou_vals=[4]#,8,16]#,32,128]
+                temperature=np.full((args.layers+1), 20, dtype=int)
+                ou_vals=[4]
                 drift_time=[0,2,4,8]
                 for i in range(len(ou_vals)):
                     for j in range(len(drift_time)):
                         row_ou=np.full((args.layers+1), ou_vals[i], dtype=int) 
                         col_ou=np.full((args.layers+1), ou_vals[i], dtype=int)
-
                         print("CASE:", ou_vals[i], drift_time[j])
-                        
-                        nonideal_f1 = test(row_ou, col_ou, 10**drift_time[j], temperature, test_features, test_support, y_test, test_mask)
+                        nonideal_f1 = test(row_ou, col_ou, 10**drift_time[j],
+                                           temperature, test_features, test_support,
+                                           y_test, test_mask)
                         print('nonideal_f1 %: {:.4f}'.format(nonideal_f1*100))
-                        #exit()
-
-        else:            
+        else:
             print('running online OU optim')
-            runtime_ou_optim(model, train_support, dataloader, criterion) # may only work for graph (model is input, fix later)
-            
-                
+            runtime_ou_optim(model, train_support, dataloader, criterion) 
 
-        '''
-        # check this here # load the model outside for loop and compute ideal test accuracy 
-        print("=> loading checkpoint '{}'".format(modelfile))
-        checkpoint = torch.load(modelfile)
-        model.load_state_dict(checkpoint['state_dict'])
-        #optimizer.load_state_dict(checkpoint['optimizer']) # not needed
-        print("=> loaded checkpoint '{}'"
-                  .format(modelfile))
-        use_cuda = torch.cuda.is_available()
-        device = torch.device("cuda" if use_cuda else "cpu")
 
-        drift_time=10**0 # 1 sec
-        temp_adj=300 # ref temp
-        ideal_f1 = test(drift_time, temp_adj, noise_config, model.to(device), test_features, test_support, y_test, test_mask, device=device)
-        print('ideal_f1: {:.4f}'.format(ideal_f1)) 
-        '''
+
      
         
 if __name__ == '__main__':
