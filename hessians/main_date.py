@@ -522,7 +522,7 @@ def main():
             device_map="auto",
             trust_remote_code=args.trust_remote_code
         )
-        model.train()
+        #model.train()
 
         # Disable FlashAttention if requested
         if args.disable_flash_attention:
